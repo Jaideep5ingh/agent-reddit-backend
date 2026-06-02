@@ -26,6 +26,15 @@ OLLAMA_DEFAULT_MODEL = "gemma4:31b-cloud"
 OLLAMA_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/") + "/api/chat"
 
 
+def _storage_state_kwargs() -> dict:
+    """If REDDIT_STORAGE_STATE points to a saved session file (from login_reddit.py),
+    launch the browser logged-in — to get past the datacenter-IP block page."""
+    path = os.environ.get("REDDIT_STORAGE_STATE", "").strip()
+    if path and os.path.exists(path):
+        return {"storage_state": path}
+    return {}
+
+
 # ── URL builders ─────────────────────────────────────────────────────────────
 
 def build_search_url(query: str, sort: str, time_filter: str) -> str:
@@ -102,6 +111,7 @@ def scrape_posts(url: str, limit: int = 50, quiet: bool = False) -> list[dict]:
                 "Chrome/124.0.0.0 Safari/537.36"
             ),
             viewport={"width": 1280, "height": 900},
+            **_storage_state_kwargs(),
         )
         page = context.new_page()
 
@@ -309,6 +319,7 @@ def fetch_thread_playwright(post_url: str) -> Optional[dict]:
                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
             ),
             viewport={"width": 1280, "height": 900},
+            **_storage_state_kwargs(),
         )
         page = context.new_page()
         try:

@@ -17,6 +17,10 @@ ENV/
 .env.*
 !.env.example
 
+# Reddit authenticated session — holds a live login, treat like a password
+reddit_state.json
+*state*.json
+
 # Playwright
 playwright-report/
 test-results/
