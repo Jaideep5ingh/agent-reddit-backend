@@ -34,6 +34,5 @@ test-results/
 # Logs
 *.log
 
-# Internal docs — kept locally, not tracked in the repo
-/DEPLOY.md
-/rag-pipeline.md
+# Internal docs / private notes — kept locally, never tracked in the repo
+/notes/
