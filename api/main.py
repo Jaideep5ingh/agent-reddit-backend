@@ -7,16 +7,23 @@ from dotenv import load_dotenv
 # api.ollama_client, scraper) and before the CORS config below.
 load_dotenv()
 
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from slowapi.errors import RateLimitExceeded
 
 from api.auth import verify_turnstile
 from api.jobs import JobStatus, get_job, make_job
 from api.models import JobResponse, JobStatusResponse, ScrapeRequest
 from api.pipeline import run_job
+from api.ratelimit import limiter, rate_limit_handler
 
 app = FastAPI(title="Reddit Scraper API", version="1.0.0")
+
+# Rate limiting (slowapi). Per-IP limits live on each route via @limiter.limit(...);
+# the limiter object must be on app.state and its 429 exception handler registered here.
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, rate_limit_handler)
 
 # The browser calls this API cross-origin (Vercel page → VM), so CORS is required.
 # Set ALLOWED_ORIGINS to a comma-separated list of allowed origins in production
@@ -33,7 +40,8 @@ app.add_middleware(
 
 
 @app.get("/health")
-async def health():
+@limiter.limit("25/minute")
+async def health(request: Request):
     return {"status": "ok"}
 
 
@@ -43,7 +51,8 @@ async def health():
     status_code=202,
     dependencies=[Depends(verify_turnstile)],
 )
-async def create_job(req: ScrapeRequest, background_tasks: BackgroundTasks):
+@limiter.limit("3/minute")
+async def create_job(request: Request, req: ScrapeRequest, background_tasks: BackgroundTasks):
     """
     Start a scrape job. Returns job_id immediately.
     Stream progress via GET /jobs/{job_id}/stream.
@@ -55,7 +64,8 @@ async def create_job(req: ScrapeRequest, background_tasks: BackgroundTasks):
 
 
 @app.get("/jobs/{job_id}/stream")
-async def stream_job(job_id: str):
+@limiter.limit("10/minute")
+async def stream_job(request: Request, job_id: str):
     """
     SSE stream for a job. Events: progress, variants, posts,
     agent_thinking, thread_fetched, report_token, done, error.
@@ -84,7 +94,8 @@ async def stream_job(job_id: str):
 
 
 @app.get("/jobs/{job_id}", response_model=JobStatusResponse)
-async def get_job_status(job_id: str):
+@limiter.limit("10/minute")
+async def get_job_status(request: Request, job_id: str):
     """Polling fallback — returns current job status and post count."""
     job = get_job(job_id)
     if not job:

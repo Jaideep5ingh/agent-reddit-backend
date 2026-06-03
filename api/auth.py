@@ -47,13 +47,13 @@ async def verify_turnstile(
     if not cf_turnstile_response:
         raise HTTPException(status_code=403, detail="Missing Turnstile token.")
 
-    # Real client IP: behind the Cloudflare tunnel, request.client.host is always
-    # 127.0.0.1 (cloudflared → uvicorn on localhost). Cloudflare injects the true
-    # client IP as CF-Connecting-IP. remoteip is optional for siteverify but a useful signal.
+    # Pass the real client IP (CF-Connecting-IP behind the tunnel — see api.netutil) to
+    # siteverify. Optional, but a useful signal. Skip the localhost fallback: 127.0.0.1
+    # is meaningless to Cloudflare, so only send a real forwarded IP.
     data = {"secret": TURNSTILE_SECRET, "response": cf_turnstile_response}
-    client_ip = request.headers.get("CF-Connecting-IP")
-    if client_ip:
-        data["remoteip"] = client_ip
+    cf_ip = request.headers.get("CF-Connecting-IP")
+    if cf_ip:
+        data["remoteip"] = cf_ip.strip()
 
     try:
         async with httpx.AsyncClient(timeout=_VERIFY_TIMEOUT) as client:
