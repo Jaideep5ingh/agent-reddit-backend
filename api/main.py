@@ -7,10 +7,11 @@ from dotenv import load_dotenv
 # api.ollama_client, scraper) and before the CORS config below.
 load_dotenv()
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
+from api.auth import verify_turnstile
 from api.jobs import JobStatus, get_job, make_job
 from api.models import JobResponse, JobStatusResponse, ScrapeRequest
 from api.pipeline import run_job
@@ -36,11 +37,17 @@ async def health():
     return {"status": "ok"}
 
 
-@app.post("/jobs", response_model=JobResponse, status_code=202)
+@app.post(
+    "/jobs",
+    response_model=JobResponse,
+    status_code=202,
+    dependencies=[Depends(verify_turnstile)],
+)
 async def create_job(req: ScrapeRequest, background_tasks: BackgroundTasks):
     """
     Start a scrape job. Returns job_id immediately.
     Stream progress via GET /jobs/{job_id}/stream.
+    Requires a valid Cloudflare Turnstile token (cf-turnstile-response header).
     """
     job = make_job()
     background_tasks.add_task(run_job, job, req)
