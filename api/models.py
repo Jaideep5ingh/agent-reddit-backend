@@ -14,7 +14,7 @@ class ScrapeRequest(BaseModel):
     report: bool = False
     min_score: int = Field(default=5, ge=0)
     max_threads: int = Field(default=15, ge=1, le=50)
-    instructions: str = ""
+    instructions: str = Field(default="", max_length=500)  # capped to limit injection/abuse payloads
     model: str = "gemma4:31b-cloud"
 
 

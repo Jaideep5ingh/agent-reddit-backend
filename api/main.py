@@ -12,6 +12,7 @@ from fastapi.responses import StreamingResponse
 from slowapi.errors import RateLimitExceeded
 from arq import create_pool
 from arq.connections import RedisSettings
+from arq.jobs import Job as ArqJob
 
 from api.auth import verify_turnstile
 from api.jobs import get_job, job_exists, make_job
@@ -83,6 +84,24 @@ async def create_job(request: Request, req: ScrapeRequest):
     req_dict = req.model_dump() if hasattr(req, "model_dump") else req.dict()
     await request.app.state.arq.enqueue_job("run_scrape", job_id, req_dict, _job_id=job_id)
     return JobResponse(job_id=job_id)
+
+
+@app.post("/jobs/{job_id}/abort")
+@limiter.limit("20/minute")
+async def abort_job(request: Request, job_id: str):
+    """Cancel a running/queued job. The arq worker raises CancelledError in the task
+    (allow_abort_jobs=True), which stops scrape/fetch/LLM and frees the rate budget.
+    No Turnstile needed — same low-risk profile as the unauthenticated stream/status."""
+    if not await job_exists(job_id):
+        raise HTTPException(status_code=404, detail="Job not found")
+    job = ArqJob(job_id, request.app.state.arq)
+    # The abort flag is registered immediately; the short timeout just bounds how long
+    # we wait for the task to actually unwind before returning.
+    try:
+        await job.abort(timeout=2)
+    except Exception:
+        pass
+    return {"status": "aborting", "job_id": job_id}
 
 
 @app.get("/jobs/{job_id}/stream")

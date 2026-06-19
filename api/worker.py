@@ -27,3 +27,4 @@ class WorkerSettings:
     max_jobs = MAX_CONCURRENT_JOBS
     job_timeout = 600  # seconds; a stuck scrape/LLM call fails instead of hanging forever
     keep_result = 0    # we store results in our own job hash; don't keep arq's result blob
+    allow_abort_jobs = True  # lets POST /jobs/{id}/abort cancel a running job (frees rate budget)

@@ -183,6 +183,14 @@ async def run_job_task(job_id: str, req: ScrapeRequest) -> None:
             "report": report_text,
         })
 
+    except asyncio.CancelledError:
+        # Job aborted (POST /jobs/{id}/abort → arq cancels this task). Mark it and
+        # tell the client, then re-raise so arq records the cancellation. The finally
+        # block still closes the stream and the async-with blocks release Chromium/httpx.
+        await update_job(job_id, status=JobStatus.ABORTED)
+        await _emit(job_id, "aborted", {"message": "Job stopped."})
+        raise
+
     except Exception as exc:
         await update_job(job_id, status=JobStatus.ERROR, error=str(exc))
         await _emit(job_id, "error", {"message": str(exc)})

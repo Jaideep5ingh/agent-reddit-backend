@@ -17,6 +17,7 @@ class JobStatus:
     RUNNING = "running"
     DONE = "done"
     ERROR = "error"
+    ABORTED = "aborted"
 
 
 def _key(job_id: str) -> str:
