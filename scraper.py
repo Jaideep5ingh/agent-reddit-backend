@@ -4,6 +4,7 @@ No API credentials required.
 """
 
 import argparse
+import asyncio
 import os
 import re
 import sys
@@ -14,6 +15,7 @@ from urllib.parse import quote_plus
 
 import httpx
 from playwright.sync_api import sync_playwright
+from playwright.async_api import async_playwright
 from rich.console import Console
 from rich.table import Table
 from rich import box
@@ -175,7 +177,11 @@ def scrape_posts(url: str, limit: int = 50, quiet: bool = False) -> list[dict]:
                     const subMatch = subHref.match(/\\/r\\/([^/?#]+)/);
                     const subreddit = subMatch ? 'r/' + subMatch[1] : '?';
                     const numbers = [...el.querySelectorAll('faceplate-number')].map(n => n.getAttribute('number') || n.innerText.trim());
-                    results.push({{ title, subreddit, score: numbers[0] || '?', comments: numbers[1] || '?', url }});
+                    // Post timestamp (ISO 8601) — free from the search card, used to
+                    // pick the latest N candidates without fetching.
+                    const timeEl = el.querySelector('faceplate-timeago[ts], time[datetime]');
+                    const created = timeEl ? (timeEl.getAttribute('ts') || timeEl.getAttribute('datetime') || '') : '';
+                    results.push({{ title, subreddit, score: numbers[0] || '?', comments: numbers[1] || '?', url, created }});
                 }});
 
                 // Subreddit page: shreddit-post
@@ -189,7 +195,8 @@ def scrape_posts(url: str, limit: int = 50, quiet: bool = False) -> list[dict]:
                         seen.add(url);
                         const title = el.getAttribute('post-title') || el.querySelector('h1,h2,h3')?.innerText.trim() || '';
                         const subreddit = el.getAttribute('subreddit-prefixed-name') || el.getAttribute('subreddit-name') || '?';
-                        results.push({{ title, subreddit, score: el.getAttribute('score') || '?', comments: el.getAttribute('comment-count') || '?', url }});
+                        const created = el.getAttribute('created-timestamp') || '';
+                        results.push({{ title, subreddit, score: el.getAttribute('score') || '?', comments: el.getAttribute('comment-count') || '?', url, created }});
                     }});
                 }}
 
@@ -309,15 +316,145 @@ def deep_search(
 
 # ── Thread fetcher ────────────────────────────────────────────────────────────
 
+# Shared page-extraction script — pulls post body + top comments out of a Reddit
+# thread page. Used by both the sync (CLI) and async (API batch) fetchers.
+THREAD_EXTRACT_JS = """
+    () => {
+        // Title
+        const titleEl = document.querySelector('h1');
+        const title = titleEl ? titleEl.innerText.trim() : document.title;
+
+        // Post body (shreddit new layout)
+        const bodyEl = document.querySelector(
+            '[slot="text-body"], [data-testid="post-content"] [data-click-id="text"], .md'
+        );
+        const selftext = bodyEl ? bodyEl.innerText.trim().slice(0, 600) : '';
+
+        // Score
+        const scoreEl = document.querySelector(
+            'shreddit-post[score], [data-testid="vote-arrows"] [id*="vote-arrows"]'
+        );
+        const score = scoreEl
+            ? parseInt(scoreEl.getAttribute('score') || '0', 10)
+            : 0;
+
+        // Subreddit
+        const subEl = document.querySelector('a[href^="/r/"]:not([href*="/comments/"])');
+        const subHref = subEl ? subEl.getAttribute('href') : '';
+        const subMatch = subHref.match(/\\/r\\/([^/?#]+)/);
+        const subreddit = subMatch ? 'r/' + subMatch[1] : '?';
+
+        // Comments — shreddit-comment elements
+        const comments = [];
+        document.querySelectorAll('shreddit-comment').forEach(el => {
+            const body = el.querySelector('[slot="comment"], p, .md');
+            const text = body ? body.innerText.trim().slice(0, 400) : '';
+            if (!text || text === '[deleted]' || text === '[removed]') return;
+            const depth = parseInt(el.getAttribute('depth') || '0', 10);
+            const voteEl = el.querySelector('faceplate-number');
+            const voteScore = voteEl
+                ? parseInt(voteEl.getAttribute('number') || '0', 10)
+                : 0;
+            comments.push({ depth, score: voteScore, body: text });
+        });
+
+        // Sort top-level comments by score
+        const topLevel = comments
+            .filter(c => c.depth === 0)
+            .sort((a, b) => b.score - a.score)
+            .slice(0, 15);
+
+        return { title, selftext, score, subreddit, comments: topLevel };
+    }
+"""
+
+_THREAD_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+
+
+def _shape_thread(data: dict, post_url: str) -> Optional[dict]:
+    """Normalise the raw evaluate() result into a thread dict (or None if empty)."""
+    if not data or not data.get("title"):
+        return None
+    return {
+        "title": data["title"],
+        "subreddit": data["subreddit"],
+        "score": data["score"],
+        "selftext": data["selftext"],
+        "url": post_url,
+        "top_comments": [{"score": c["score"], "body": c["body"]} for c in data["comments"]],
+    }
+
+
+def _session_cookies() -> dict:
+    """Load cookies from the saved Playwright storage_state so httpx requests are
+    authenticated the same way the browser is (gets past Reddit's logged-out gate)."""
+    import json as _json
+    path = os.environ.get("REDDIT_STORAGE_STATE", "").strip()
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        state = _json.load(open(path))
+        return {c["name"]: c["value"] for c in state.get("cookies", [])}
+    except Exception:
+        return {}
+
+
+def _parse_thread_json(payload, post_url: str) -> Optional[dict]:
+    """Turn Reddit's `<thread>/.json` response into our thread dict.
+
+    payload is `[post_listing, comments_listing]`. We pull the post's title/body/
+    score/subreddit and the top-level comments (kind 't1', depth 0), ranked by
+    score — mirroring what the old DOM scraper produced.
+    """
+    try:
+        post = payload[0]["data"]["children"][0]["data"]
+    except (KeyError, IndexError, TypeError):
+        return None
+
+    title = post.get("title", "")
+    if not title:
+        return None
+
+    comments = []
+    try:
+        for child in payload[1]["data"]["children"]:
+            if child.get("kind") != "t1":
+                continue
+            d = child.get("data", {})
+            if d.get("depth", 0) != 0:
+                continue
+            body = (d.get("body") or "").strip()
+            if not body or body in ("[deleted]", "[removed]"):
+                continue
+            score = d.get("score")
+            comments.append({"score": int(score) if isinstance(score, int) else 0,
+                             "body": body[:400]})
+    except (KeyError, IndexError, TypeError):
+        pass
+
+    comments.sort(key=lambda c: c["score"], reverse=True)
+
+    return {
+        "title": title,
+        "subreddit": post.get("subreddit_name_prefixed") or (
+            "r/" + post.get("subreddit", "") if post.get("subreddit") else "?"
+        ),
+        "score": post.get("score", 0) if isinstance(post.get("score"), int) else 0,
+        "selftext": (post.get("selftext") or "")[:600],
+        "url": post_url,
+        "top_comments": comments[:15],
+    }
+
+
 def fetch_thread_playwright(post_url: str) -> Optional[dict]:
-    """Scrape a Reddit thread page (post body + comments) using a real browser."""
+    """Scrape a single Reddit thread page (post body + comments) — sync, used by the CLI."""
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-            ),
+            user_agent=_THREAD_UA,
             viewport={"width": 1280, "height": 900},
             **_storage_state_kwargs(),
         )
@@ -328,71 +465,95 @@ def fetch_thread_playwright(post_url: str) -> Optional[dict]:
         except Exception:
             browser.close()
             return None
-
-        data = page.evaluate("""
-            () => {
-                // Title
-                const titleEl = document.querySelector('h1');
-                const title = titleEl ? titleEl.innerText.trim() : document.title;
-
-                // Post body (shreddit new layout)
-                const bodyEl = document.querySelector(
-                    '[slot="text-body"], [data-testid="post-content"] [data-click-id="text"], .md'
-                );
-                const selftext = bodyEl ? bodyEl.innerText.trim().slice(0, 600) : '';
-
-                // Score
-                const scoreEl = document.querySelector(
-                    'shreddit-post[score], [data-testid="vote-arrows"] [id*="vote-arrows"]'
-                );
-                const score = scoreEl
-                    ? parseInt(scoreEl.getAttribute('score') || '0', 10)
-                    : 0;
-
-                // Subreddit
-                const subEl = document.querySelector('a[href^="/r/"]:not([href*="/comments/"])');
-                const subHref = subEl ? subEl.getAttribute('href') : '';
-                const subMatch = subHref.match(/\\/r\\/([^/?#]+)/);
-                const subreddit = subMatch ? 'r/' + subMatch[1] : '?';
-
-                // Comments — shreddit-comment elements
-                const comments = [];
-                document.querySelectorAll('shreddit-comment').forEach(el => {
-                    const body = el.querySelector(
-                        '[slot="comment"], p, .md'
-                    );
-                    const text = body ? body.innerText.trim().slice(0, 400) : '';
-                    if (!text || text === '[deleted]' || text === '[removed]') return;
-                    const depth = parseInt(el.getAttribute('depth') || '0', 10);
-                    const voteEl = el.querySelector('faceplate-number');
-                    const voteScore = voteEl
-                        ? parseInt(voteEl.getAttribute('number') || '0', 10)
-                        : 0;
-                    comments.push({ depth, score: voteScore, body: text });
-                });
-
-                // Sort top-level comments by score
-                const topLevel = comments
-                    .filter(c => c.depth === 0)
-                    .sort((a, b) => b.score - a.score)
-                    .slice(0, 15);
-
-                return { title, selftext, score, subreddit, comments: topLevel };
-            }
-        """)
+        data = page.evaluate(THREAD_EXTRACT_JS)
         browser.close()
 
-    if not data or not data.get("title"):
-        return None
+    return _shape_thread(data, post_url)
 
-    return {
-        "title": data["title"],
-        "subreddit": data["subreddit"],
-        "score": data["score"],
-        "selftext": data["selftext"],
-        "url": post_url,
-        "top_comments": [{"score": c["score"], "body": c["body"]} for c in data["comments"]],
-    }
+
+async def fetch_threads_batch(
+    urls: list[str],
+    concurrency: int = 8,
+    on_done=None,
+) -> list[dict]:
+    """Fetch many Reddit threads via Reddit's `<thread>/.json` REST endpoint.
+
+    No browser: Playwright is only used to gather the post links (scrape_posts).
+    Each thread's content is a plain authenticated HTTP GET to the `.json` endpoint
+    (~0.1s/thread vs ~2.7s for a rendered page). Saved login cookies authenticate.
+
+    Reddit rate-limits at ~100 requests per ~minute window and reports the budget
+    in headers (x-ratelimit-remaining / x-ratelimit-reset). This fetcher is
+    HEADER-AWARE: a shared pause-gate makes all workers back off exactly as long as
+    Reddit's reset header says when the budget runs low or a 429 hits, so we can
+    fetch a large batch to completion without losing threads (it just paces itself
+    across windows rather than hammering and getting blocked).
+
+    `on_done(url, ok)` is an optional async callback fired per finished fetch.
+    Returns the successfully-fetched thread dicts; failed fetches are dropped.
+    """
+    if not urls:
+        return []
+
+    results: list[Optional[dict]] = [None] * len(urls)
+    sem = asyncio.Semaphore(max(1, concurrency))
+    cookies = _session_cookies()
+    state = {"resume_at": 0.0}  # shared pause-gate (monotonic seconds)
+
+    def _arm_pause(resp) -> None:
+        """When the budget is low or we got 429'd, pause ALL workers until Reddit's
+        reset window passes (read from the header, fall back to a sane default)."""
+        try:
+            reset = float(resp.headers.get("x-ratelimit-reset", 0) or 0)
+        except (TypeError, ValueError):
+            reset = 0.0
+        wait = reset if reset > 0 else (5.0 if resp.status_code == 429 else 0.0)
+        if wait > 0:
+            state["resume_at"] = max(state["resume_at"], time.monotonic() + wait + 0.5)
+
+    async def _wait_gate() -> None:
+        while True:
+            delay = state["resume_at"] - time.monotonic()
+            if delay <= 0:
+                return
+            await asyncio.sleep(min(delay, 5.0))
+
+    async with httpx.AsyncClient(
+        cookies=cookies,
+        headers={"User-Agent": _THREAD_UA},
+        timeout=20,
+        follow_redirects=True,
+    ) as client:
+
+        async def fetch_one(idx: int, url: str) -> None:
+            thread = None
+            async with sem:
+                for attempt in range(4):
+                    await _wait_gate()  # respect a pause armed by another worker
+                    try:
+                        resp = await client.get(url.rstrip("/") + "/.json")
+                    except Exception:
+                        break
+                    if resp.status_code == 200 and "json" in resp.headers.get("content-type", ""):
+                        thread = _parse_thread_json(resp.json(), url)
+                        # Proactively pause if we're about to exhaust the window.
+                        try:
+                            if float(resp.headers.get("x-ratelimit-remaining", 99)) < 3:
+                                _arm_pause(resp)
+                        except (TypeError, ValueError):
+                            pass
+                        break
+                    if resp.status_code == 429:
+                        _arm_pause(resp)  # wait out the reset window, then retry
+                        continue
+                    break
+            results[idx] = thread
+            if on_done is not None:
+                await on_done(url, thread is not None)
+
+        await asyncio.gather(*[fetch_one(i, u) for i, u in enumerate(urls)])
+
+    return [t for t in results if t is not None]
 
 
 def format_thread_for_prompt(i: int, thread: dict) -> str:
