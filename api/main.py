@@ -15,11 +15,16 @@ from arq.connections import RedisSettings
 from arq.jobs import Job as ArqJob
 
 from api.auth import verify_turnstile
+from api.observability import init_sentry
 from api.jobs import get_job, job_exists, make_job
 from api.models import JobResponse, JobStatusResponse, ScrapeRequest
 from api.redis_client import REDIS_URL
 from api import events
 from api.ratelimit import limiter, rate_limit_handler
+
+# Sentry (no-op unless SENTRY_DSN is set). Init before the app so the FastAPI
+# integration instruments it and captures unhandled route errors.
+init_sentry("api")
 
 app = FastAPI(title="Reddit Scraper API", version="1.0.0")
 
@@ -54,9 +59,11 @@ async def _shutdown():
         await pool.aclose()
 
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 @limiter.limit("25/minute")
 async def health(request: Request):
+    # HEAD too — uptime monitors (e.g. UptimeRobot) default to HEAD; a GET-only
+    # route returns 405 and the monitor wrongly reports the API as down.
     return {"status": "ok"}
 
 

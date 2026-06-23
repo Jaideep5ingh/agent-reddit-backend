@@ -7,3 +7,4 @@ python-dotenv>=1.0.0
 slowapi==0.1.9
 redis>=5.0
 arq>=0.25
+sentry-sdk[fastapi]>=2.0

@@ -16,6 +16,7 @@ from api import events
 from api.jobs import JobStatus, update_job
 from api.models import ScrapeRequest
 from api.embedding import select_top_threads
+from api.observability import capture_exc
 from api.report import stream_report_to_queue
 from scraper import build_search_url, fetch_threads_batch, get_query_variants, scrape_posts
 
@@ -192,6 +193,7 @@ async def run_job_task(job_id: str, req: ScrapeRequest) -> None:
         raise
 
     except Exception as exc:
+        capture_exc(exc)  # report to Sentry (we handle here instead of re-raising)
         await update_job(job_id, status=JobStatus.ERROR, error=str(exc))
         await _emit(job_id, "error", {"message": str(exc)})
 

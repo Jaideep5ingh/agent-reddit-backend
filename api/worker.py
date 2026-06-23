@@ -10,8 +10,12 @@ load_dotenv()
 from arq.connections import RedisSettings
 
 from api.models import ScrapeRequest
+from api.observability import init_sentry
 from api.pipeline import run_job_task
 from api.redis_client import REDIS_URL
+
+# Worker is a separate process from the API → needs its own Sentry init (no-op if unset).
+init_sentry("worker")
 
 MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_JOBS", "3"))
 
