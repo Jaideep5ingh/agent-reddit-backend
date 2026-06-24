@@ -11,6 +11,7 @@ All progress is emitted via Redis Streams to the SSE endpoint.
 """
 
 import asyncio
+import time
 
 from api import events
 from api.jobs import JobStatus, update_job
@@ -51,8 +52,36 @@ async def _scrape_all(req: ScrapeRequest, job_id: str):
         })
 
         urls = [build_search_url(q, req.sort, req.time_filter) for q in all_queries]
+
+        # Live "posts found" counter during the ~40s scrape. Each parallel search
+        # reports its running count (cheap — it's already computed every scroll); we
+        # emit the SUM as a status message so the user sees scraping make progress
+        # instead of a frozen spinner. The scrapes run in worker threads, so the
+        # callback hops back to this event loop via run_coroutine_threadsafe. A loose
+        # race on the display number is harmless, so no lock; emits are throttled.
+        loop = asyncio.get_running_loop()
+        counts = [0] * len(all_queries)
+        last_emit = [0.0]
+
+        def make_on_count(idx: int):
+            def on_count(n: int) -> None:
+                counts[idx] = n
+                now = time.monotonic()
+                if now - last_emit[0] > 0.7:
+                    last_emit[0] = now
+                    total = sum(counts)
+                    asyncio.run_coroutine_threadsafe(
+                        _emit(job_id, "progress", {
+                            "step": "scraping",
+                            "message": f"Scanning Reddit — {total} posts found…",
+                        }),
+                        loop,
+                    )
+            return on_count
+
         results = await asyncio.gather(*[
-            asyncio.to_thread(scrape_posts, url, req.limit, True) for url in urls
+            asyncio.to_thread(scrape_posts, url, req.limit, True, make_on_count(i))
+            for i, url in enumerate(urls)
         ], return_exceptions=True)
 
         seen = set()

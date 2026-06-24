@@ -31,7 +31,12 @@ EMBED_MODEL = "nomic-embed-text"
 DEDUP_THRESHOLD = 0.95
 # Cap embed input per thread — nomic context is ~2k tokens; title + body excerpt
 # + top comments is plenty of relevance signal.
-EMBED_CHAR_CAP = 2000
+EMBED_CHAR_CAP = 1000
+# Only the first N comments feed the ranking vector. Embedding on the VM's CPU is
+# token-bound (~600 tok/s, no GPU), so fewer comments = faster scoring. NOTE: the
+# EMBED_CHAR_CAP above is still the binding limit for comment-heavy threads — lower
+# it too if scoring latency needs a bigger cut.
+EMBED_TOP_COMMENTS = 10
 
 
 def _thread_text(t: dict) -> str:
@@ -40,7 +45,7 @@ def _thread_text(t: dict) -> str:
     body = (t.get("selftext") or "")[:400]
     if body:
         parts.append(body)
-    for c in t.get("top_comments", []):
+    for c in t.get("top_comments", [])[:EMBED_TOP_COMMENTS]:
         b = (c.get("body") or "").strip()
         if b:
             parts.append(b)
@@ -102,7 +107,12 @@ def _rrf_fuse(*score_lists, k: int = 60) -> list[float]:
 
 
 async def _embed(client: httpx.AsyncClient, texts: list[str]) -> list[list[float]]:
-    resp = await client.post(OLLAMA_EMBED_URL, json={"model": EMBED_MODEL, "input": texts})
+    # keep_alive pins nomic in RAM between jobs so we don't pay a cold model reload
+    # on the first embed of each job (the daemon's default evicts it after 5 min idle).
+    resp = await client.post(
+        OLLAMA_EMBED_URL,
+        json={"model": EMBED_MODEL, "input": texts, "keep_alive": "30m"},
+    )
     resp.raise_for_status()
     return resp.json()["embeddings"]
 

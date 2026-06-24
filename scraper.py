@@ -99,7 +99,7 @@ def get_query_variants(query: str, model: str = OLLAMA_DEFAULT_MODEL) -> list[st
 
 # ── Playwright scraper ────────────────────────────────────────────────────────
 
-def scrape_posts(url: str, limit: int = 50, quiet: bool = False) -> list[dict]:
+def scrape_posts(url: str, limit: int = 50, quiet: bool = False, on_count=None) -> list[dict]:
     def log(msg: str) -> None:
         if not quiet:
             console.print(msg)
@@ -137,6 +137,11 @@ def scrape_posts(url: str, limit: int = 50, quiet: bool = False) -> list[dict]:
         stalled = 0
         for attempt in range(20):
             current_count = page.evaluate(COUNT_JS)
+            if on_count is not None:
+                try:
+                    on_count(current_count)  # live progress → SSE status (best-effort)
+                except Exception:
+                    pass
             if not quiet:
                 console.print(f"[dim]  Scroll {attempt + 1}: {current_count} posts...[/dim]", end="\r")
             if current_count >= limit:
